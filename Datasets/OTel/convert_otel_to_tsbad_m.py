@@ -13,6 +13,13 @@ normal. Series with no anomalous window are skipped.
 Output name: [index]_OTel_id_[id]_WebService_tr_[train]_1st_[first anomaly].csv
 Columns: features 0..N-1, then Label. tr = number of windows before FI_START (the baseline).
 
+Label correlation between series. The rule above depends only on the target service, never on
+the signal, so the three signals of one service share a ground truth wherever their window grids
+agree. The two testbeds also ran one synchronised fault schedule, which makes some otel-demo and
+sockshop services share a ground truth as well. The summary therefore carries label_vector_id,
+which is equal for series whose anomalous timestamps are identical, plus max_label_jaccard and
+max_label_jaccard_with, which give the closest other series by Jaccard on anomalous timestamps.
+
 usage: convert_otel_to_tsbad_m.py FEATURES_DIR MANIFEST_JSON TIMESTAMPS_ENV OUT_DIR [START_INDEX] [COOLDOWN]
 """
 import json, sys
@@ -69,7 +76,7 @@ runs["targets"] = [
 
 OUT.mkdir(parents=True, exist_ok=True)
 tables = {s: pd.read_parquet(SRC / f) for s, f in FILES.items()}
-idx, sid, rows = START_INDEX, 1, []
+idx, sid, rows, anom = START_INDEX, 1, [], {}
 for signal, testbed, target, name in SERIES:
     df = tables[signal]
     d = df[df.service == name].sort_values("timestamp").reset_index(drop=True)
@@ -96,6 +103,7 @@ for signal, testbed, target, name in SERIES:
     fname = f"{idx:03d}_OTel_id_{sid}_WebService_tr_{tr}_1st_{first}.csv"
     X.to_csv(OUT / fname, index=False)
     segs = int((np.diff(np.r_[0, lab, 0]) == 1).sum())
+    anom[fname] = frozenset(d["timestamp"][lab == 1].astype("int64").tolist())
     rows.append(dict(file_name=fname, signal=signal, testbed=testbed, service=target,
                      n=len(lab), n_features=len(feats), train_index=tr, first_anomaly=first,
                      runs_targeting=n_runs, anomaly_segments=segs, anomaly_windows=int(lab.sum()),
@@ -104,7 +112,28 @@ for signal, testbed, target, name in SERIES:
                      size_kb=round((OUT / fname).stat().st_size / 1024, 1)))
     idx += 1; sid += 1
 man = pd.DataFrame(rows)
+
+# Label-correlation columns. See the docstring note above.
+vec_id, seen = {}, {}
+for f in man.file_name:
+    vec_id[f] = seen.setdefault(anom[f], len(seen) + 1)
+best = {}
+for f in man.file_name:
+    j, other = 0.0, ""
+    for g in man.file_name:
+        if g == f:
+            continue
+        u = len(anom[f] | anom[g])
+        v = len(anom[f] & anom[g]) / u if u else 0.0
+        if v > j:
+            j, other = v, g
+    best[f] = (round(j, 3), other.split("_")[0])
+man.insert(man.columns.get_loc("prevalence") + 1, "label_vector_id", [vec_id[f] for f in man.file_name])
+man.insert(man.columns.get_loc("label_vector_id") + 1, "max_label_jaccard", [best[f][0] for f in man.file_name])
+man.insert(man.columns.get_loc("max_label_jaccard") + 1, "max_label_jaccard_with", [best[f][1] for f in man.file_name])
+
 man.to_csv(OUT / "OTel_series_summary.csv", index=False)
 pd.set_option("display.width", 250)
 print(man.to_string())
 print("series:", len(man), "total MB:", round(man.size_kb.sum() / 1024, 1))
+print("distinct label vectors:", man.label_vector_id.nunique(), "of", len(man), "series")
